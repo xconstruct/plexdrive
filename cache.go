@@ -23,11 +23,14 @@ import (
 
 // Cache is the cache
 type Cache struct {
-	session   *mgo.Session
-	dbName    string
-	tokenPath string
-	chunkPath string
-	pop       sync.Mutex
+	session         *mgo.Session
+	dbName          string
+	tokenPath       string
+	chunkPath       string
+	maxTempSize     float64
+	currentTempSize float64
+	tempLock        sync.Mutex
+	popLock         sync.Mutex
 }
 
 const (
@@ -67,12 +70,23 @@ type DownloadRequest struct {
 
 // Chunk is a chunk that has been stored in cache
 type Chunk struct {
-	ID   string `bson:"_id,omitempty"`
-	Path string
+	ID     string `bson:"_id,omitempty"`
+	Size   float64
+	Path   string
+	Access time.Time
 }
 
 // NewCache creates a new cache instance
-func NewCache(mongoURL, mongoUser, mongoPass, mongoDatabase, cacheBasePath, tempBasePath string, sqlDebug bool) (*Cache, error) {
+func NewCache(
+	mongoURL,
+	mongoUser,
+	mongoPass,
+	mongoDatabase,
+	cacheBasePath,
+	tempBasePath string,
+	maxTempSize int64,
+	sqlDebug bool) (*Cache, error) {
+
 	Log.Debugf("Opening cache connection")
 
 	session, err := mgo.Dial(mongoURL)
@@ -82,10 +96,11 @@ func NewCache(mongoURL, mongoUser, mongoPass, mongoDatabase, cacheBasePath, temp
 	}
 
 	cache := Cache{
-		session:   session,
-		dbName:    mongoDatabase,
-		tokenPath: filepath.Join(cacheBasePath, "token.json"),
-		chunkPath: filepath.Join(tempBasePath, "chunks"),
+		session:     session,
+		dbName:      mongoDatabase,
+		tokenPath:   filepath.Join(cacheBasePath, "token.json"),
+		chunkPath:   filepath.Join(tempBasePath, "chunks"),
+		maxTempSize: float64(maxTempSize),
 	}
 
 	// getting the db
@@ -310,8 +325,8 @@ func (c *Cache) DeleteDownload(id string) {
 
 // PopDownloadQueue pops an element from the queue in correct order (this request is blocking)
 func (c *Cache) PopDownloadQueue() *DownloadRequest {
-	c.pop.Lock()
-	defer c.pop.Unlock()
+	c.popLock.Lock()
+	defer c.popLock.Unlock()
 
 	response := make(chan *DownloadRequest)
 
@@ -348,11 +363,16 @@ func (c *Cache) ChunkExists(id string) bool {
 
 // StoreChunk stores a chunk to disk/cache
 func (c *Cache) StoreChunk(id string, content []byte) error {
+	// clean the last chunk if necessary
+	c.CheckChunkCleanup()
+
 	db := c.session.DB(c.dbName).C("chunks")
 
 	chunk := Chunk{
-		ID:   id,
-		Path: filepath.Join(c.chunkPath, id),
+		ID:     id,
+		Size:   float64(len(content)),
+		Path:   filepath.Join(c.chunkPath, id),
+		Access: time.Now(),
 	}
 	if _, err := db.Upsert(bson.M{"_id": id}, &chunk); nil != err {
 		return fmt.Errorf("Could not store chunk %v", id)
@@ -363,6 +383,12 @@ func (c *Cache) StoreChunk(id string, content []byte) error {
 	if err := ioutil.WriteFile(chunk.Path, content, 0777); nil != err {
 		return fmt.Errorf("Could not write chunk %v to path %v", id, chunk.Path)
 	}
+
+	// increase the total chunk usage
+	c.tempLock.Lock()
+	c.currentTempSize += chunk.Size
+	c.tempLock.Unlock()
+
 	return nil
 }
 
@@ -385,12 +411,18 @@ func (c *Cache) GetChunk(id string, fOffset, offset, size int64) ([]byte, error)
 		var chunk Chunk
 		if err := db.Find(bson.M{"_id": id}).One(&chunk); nil != err {
 			chunkChannel <- chunkResponse{
-				err: fmt.Errorf("Could not chunk %v", id),
+				err: fmt.Errorf("Could not get chunk %v", id),
 			}
 			return
 		}
 		chunkChannel <- chunkResponse{
 			chunk: &chunk,
+		}
+
+		// touch chunk
+		chunk.Access = time.Now()
+		if _, err := db.Upsert(bson.M{"_id": id}, &chunk); nil != err {
+			Log.Warningf("Could not touch chunk %v", chunk.ID)
 		}
 	}()
 
@@ -415,4 +447,33 @@ func (c *Cache) GetChunk(id string, fOffset, offset, size int64) ([]byte, error)
 	}
 
 	return nil, fmt.Errorf("Could not find chunk %v", id)
+}
+
+func (c *Cache) CheckChunkCleanup() {
+	if c.currentTempSize >= c.maxTempSize*0.8 {
+		c.DeleteOldestChunk()
+	}
+}
+
+func (c *Cache) DeleteOldestChunk() {
+	db := c.session.DB(c.dbName).C("chunks")
+
+	var chunk Chunk
+	if err := db.Find(nil).Sort("access").One(&chunk); nil != err {
+		Log.Debugf("%v", err)
+		Log.Warningf("Could not delete oldest chunk, watch your storage usage!!!")
+	}
+
+	if err := db.Remove(bson.M{"_id": chunk.ID}); nil != err {
+		Log.Debugf("%v", err)
+		Log.Warningf("Could not delete oldest chunk info %v", chunk.ID)
+	}
+	if err := os.Remove(chunk.Path); nil != err {
+		Log.Debugf("%v", err)
+		Log.Warningf("Could not delete oldest chunk %v", chunk.ID)
+	}
+
+	c.tempLock.Lock()
+	c.currentTempSize -= chunk.Size
+	c.tempLock.Unlock()
 }

@@ -35,6 +35,7 @@ func main() {
 	argRootNodeID := flag.String("root-node-id", "root", "The ID of the root node to mount (use this for only mount a sub directory)")
 	argConfigPath := flag.StringP("config", "c", filepath.Join(user.HomeDir, ".plexdrive"), "The path to the configuration directory")
 	argTempPath := flag.StringP("temp", "t", os.TempDir(), "Path to a temporary directory to store temporary data")
+	argMaxTempSize := flag.String("max-temp-size", "1G", "The maximum size of the temporary chunk directory (units: B, K, M, G)")
 	argMongoURL := flag.StringP("mongo-host", "m", "localhost", "MongoDB host")
 	argMongoUser := flag.String("mongo-user", "", "MongoDB username")
 	argMongoPass := flag.String("mongo-password", "", "MongoDB password")
@@ -43,9 +44,6 @@ func main() {
 	argChunkLoadThreads := flag.Int("chunk-load-threads", runtime.NumCPU(), "The number of threads to use for downloading chunks")
 	argChunkLoadAhead := flag.Int("chunk-load-ahead", 4, "The number of chunks that should be read ahead")
 	argRefreshInterval := flag.Duration("refresh-interval", 5*time.Minute, "The time to wait till checking for changes")
-	argClearInterval := flag.Duration("clear-chunk-interval", 1*time.Minute, "The time to wait till clearing the chunk directory")
-	argClearChunkAge := flag.Duration("clear-chunk-age", 30*time.Minute, "The maximum age of a cached chunk file")
-	// argClearChunkMaxSize := flag.String("clear-chunk-max-size", "", "The maximum size of the temporary chunk directory (units: B, K, M, G)")
 	argMountOptions := flag.StringP("fuse-options", "o", "", "Fuse mount options (e.g. -fuse-options allow_other,...)")
 	argVersion := flag.Bool("version", false, "Displays program's version information")
 	argUID := flag.Int64("uid", -1, "Set the mounts UID (-1 = default permissions)")
@@ -120,15 +118,13 @@ func main() {
 	Log.Debugf("root-node-id         : %v", *argRootNodeID)
 	Log.Debugf("config               : %v", *argConfigPath)
 	Log.Debugf("temp                 : %v", *argTempPath)
+	Log.Debugf("max-temp-size        : %v", *argMaxTempSize)
 	Log.Debugf("mongo-host           : %v", *argMongoURL)
 	Log.Debugf("mongo-user           : %v", *argMongoUser)
 	Log.Debugf("mongo-password       : %v", *argMongoPass)
 	Log.Debugf("mongo-database       : %v", *argMongoDatabase)
 	Log.Debugf("chunk-size           : %v", *argChunkSize)
 	Log.Debugf("refresh-interval     : %v", *argRefreshInterval)
-	Log.Debugf("clear-chunk-interval : %v", *argClearInterval)
-	Log.Debugf("clear-chunk-age      : %v", *argClearChunkAge)
-	// Log.Debugf("clear-chunk-max-size : %v", *argClearChunkMaxSize)
 	Log.Debugf("fuse-options         : %v", *argMountOptions)
 	Log.Debugf("UID                  : %v", uid)
 	Log.Debugf("GID                  : %v", gid)
@@ -149,11 +145,11 @@ func main() {
 		Log.Errorf("%v", err)
 		os.Exit(2)
 	}
-	// clearMaxChunkSize, err := parseSizeArg(*argClearChunkMaxSize)
-	// if nil != err {
-	// 	Log.Errorf("%v", err)
-	// 	os.Exit(2)
-	// }
+	maxTempSize, err := parseSizeArg(*argMaxTempSize)
+	if nil != err {
+		Log.Errorf("%v", err)
+		os.Exit(2)
+	}
 
 	// read the configuration
 	configPath := filepath.Join(*argConfigPath, "config.json")
@@ -167,7 +163,15 @@ func main() {
 		}
 	}
 
-	cache, err := NewCache(*argMongoURL, *argMongoUser, *argMongoPass, *argMongoDatabase, *argConfigPath, *argTempPath, *argLogLevel > 3)
+	cache, err := NewCache(
+		*argMongoURL,
+		*argMongoUser,
+		*argMongoPass,
+		*argMongoDatabase,
+		*argConfigPath,
+		*argTempPath,
+		maxTempSize,
+		*argLogLevel > 3)
 	if nil != err {
 		Log.Errorf("%v", err)
 		os.Exit(4)
@@ -188,7 +192,6 @@ func main() {
 
 	// check os signals like SIGINT/TERM
 	checkOsSignals(argMountPoint)
-	// go CleanChunkDir(chunkPath, *argClearInterval, *argClearChunkAge, 0 /*, clearMaxChunkSize*/)
 	if err := Mount(drive, downloadManager, argMountPoint, mountOptions, uid, gid, umask); nil != err {
 		Log.Debugf("%v", err)
 		os.Exit(5)
