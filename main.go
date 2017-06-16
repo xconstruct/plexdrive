@@ -142,7 +142,6 @@ func main() {
 		Log.Debugf("%v", err)
 		os.Exit(1)
 	}
-	chunkPath := filepath.Join(*argTempPath, "chunks")
 
 	// set the global buffer configuration
 	chunkSize, err := parseSizeArg(*argChunkSize)
@@ -181,13 +180,7 @@ func main() {
 		os.Exit(4)
 	}
 
-	chunkManager, err := NewChunkManager(chunkPath, chunkSize)
-	if nil != err {
-		Log.Errorf("%v", err)
-		os.Exit(4)
-	}
-
-	downloadManager, err := NewDownloadManager(*argChunkLoadThreads, *argChunkLoadAhead, drive.getNativeClient(), chunkManager)
+	downloadManager, err := NewDownloadManager(*argChunkLoadThreads, *argChunkLoadAhead, chunkSize, drive.getNativeClient(), cache)
 	if nil != err {
 		Log.Errorf("%v", err)
 		os.Exit(4)
@@ -195,7 +188,7 @@ func main() {
 
 	// check os signals like SIGINT/TERM
 	checkOsSignals(argMountPoint)
-	go CleanChunkDir(chunkPath, *argClearInterval, *argClearChunkAge, 0 /*, clearMaxChunkSize*/)
+	// go CleanChunkDir(chunkPath, *argClearInterval, *argClearChunkAge, 0 /*, clearMaxChunkSize*/)
 	if err := Mount(drive, downloadManager, argMountPoint, mountOptions, uid, gid, umask); nil != err {
 		Log.Debugf("%v", err)
 		os.Exit(5)

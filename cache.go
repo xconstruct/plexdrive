@@ -3,13 +3,19 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/ioutil"
+	"math"
 	"path/filepath"
 
 	"time"
 
 	. "github.com/claudetech/loggo/default"
 	"golang.org/x/oauth2"
+
+	"sync"
+
+	"os"
 
 	"gopkg.in/mgo.v2"
 	"gopkg.in/mgo.v2/bson"
@@ -20,6 +26,7 @@ type Cache struct {
 	session   *mgo.Session
 	dbName    string
 	tokenPath string
+	pop       sync.Mutex
 }
 
 const (
@@ -28,12 +35,6 @@ const (
 	// DeleteAction deletes an object in cache
 	DeleteAction = iota
 )
-
-type cacheAction struct {
-	action  int
-	object  *APIObject
-	instant bool
-}
 
 // APIObject is a Google Drive file object
 type APIObject struct {
@@ -51,6 +52,22 @@ type APIObject struct {
 type PageToken struct {
 	ID    string `bson:"_id,omitempty"`
 	Token string
+}
+
+// DownloadRequest is a download queue request
+type DownloadRequest struct {
+	ID      string `bson:"_id,omitempty"`
+	Object  *APIObject
+	Offset  int64
+	Size    int64
+	Active  bool
+	Preload bool
+}
+
+// Chunk is a chunk that has been stored in cache
+type Chunk struct {
+	ID   string `bson:"_id,omitempty"`
+	Path string
 }
 
 // NewCache creates a new cache instance
@@ -81,6 +98,24 @@ func NewCache(mongoURL, mongoUser, mongoPass, mongoDatabase, cacheBasePath strin
 	col := db.C("api_objects")
 	col.EnsureIndex(mgo.Index{Key: []string{"parents"}})
 	col.EnsureIndex(mgo.Index{Key: []string{"name"}})
+	col = db.C("downloads")
+	col.EnsureIndex(mgo.Index{Key: []string{"active"}})
+	col.EnsureIndex(mgo.Index{Key: []string{"preload"}})
+
+	// clear database caches
+	downloads := db.C("downloads")
+	if _, err := downloads.RemoveAll(nil); nil != err {
+		Log.Debugf("%v", err)
+		Log.Warningf("Could not clear pending download requests")
+	}
+	chunks := db.C("chunks")
+	if _, err := chunks.RemoveAll(nil); nil != err {
+		Log.Debugf("%v", err)
+		Log.Warningf("Could not clear old chunk entries")
+	}
+	if err := os.RemoveAll("/tmp/chunks"); nil != err {
+		Log.Warningf("Could not clear old chunk files")
+	}
 
 	return &cache, nil
 }
@@ -216,4 +251,133 @@ func (c *Cache) GetStartPageToken() (string, error) {
 
 	Log.Tracef("Got start page token %v", pageToken.Token)
 	return pageToken.Token, nil
+}
+
+// NewDownloadRequest creates a new download request
+func NewDownloadRequest(object *APIObject, offset, size int64, preload bool) *DownloadRequest {
+	return &DownloadRequest{
+		ID:      fmt.Sprintf("%v:%v", object.ObjectID, offset),
+		Object:  object,
+		Offset:  offset,
+		Size:    size,
+		Active:  false,
+		Preload: preload,
+	}
+}
+
+func (c *Cache) AddToDownloadQueue(request *DownloadRequest) {
+	db := c.session.DB(c.dbName).C("downloads")
+
+	if err := db.Insert(request); nil != err && !mgo.IsDup(err) {
+		Log.Debugf("%v", err)
+		Log.Warningf("Could not insert download request %v", request.ID)
+	}
+}
+
+func (c *Cache) DownloadRunning(id string) bool {
+	db := c.session.DB(c.dbName).C("downloads")
+
+	n, err := db.Find(bson.M{"_id": id, "active": "true"}).Count()
+	if nil != err {
+		return false
+	}
+	return n > 0
+}
+
+func (c *Cache) ActivateDownload(request *DownloadRequest) error {
+	db := c.session.DB(c.dbName).C("downloads")
+
+	request.Active = true
+	if _, err := db.Upsert(bson.M{"_id": request.ID}, request); nil != err {
+		return fmt.Errorf("Could not activate download request %v", request.ID)
+	}
+	return nil
+}
+
+func (c *Cache) DeleteDownload(id string) {
+	db := c.session.DB(c.dbName).C("downloads")
+
+	if err := db.Remove(bson.M{"_id": id}); nil != err {
+		Log.Warningf("Could not delete download request %v", id)
+	}
+}
+
+func (c *Cache) PopDownloadQueue() *DownloadRequest {
+	c.pop.Lock()
+	defer c.pop.Unlock()
+
+	response := make(chan *DownloadRequest)
+
+	go func() {
+		db := c.session.DB(c.dbName).C("downloads")
+
+		var request DownloadRequest
+		for {
+			if err := db.Find(bson.M{"active": false}).Sort("preload").One(&request); nil == err {
+				if err := db.Remove(bson.M{"_id": request.ID}); nil != err {
+					Log.Warningf("Could not delete download request %v", request.ID)
+				}
+				break
+			} else {
+				time.Sleep(500 * time.Millisecond)
+			}
+		}
+		response <- &request
+	}()
+
+	return <-response
+}
+
+func (c *Cache) ChunkExists(id string) bool {
+	db := c.session.DB(c.dbName).C("chunks")
+
+	n, err := db.Find(bson.M{"_id": id}).Count()
+	if nil != err {
+		return false
+	}
+	return n > 0
+}
+
+func (c *Cache) StoreChunk(id string, content []byte) error {
+	db := c.session.DB(c.dbName).C("chunks")
+
+	chunk := Chunk{
+		ID:   id,
+		Path: filepath.Join("/tmp/chunks/", id),
+	}
+	if _, err := db.Upsert(bson.M{"_id": id}, &chunk); nil != err {
+		return fmt.Errorf("Could not store chunk %v", id)
+	}
+	if err := os.MkdirAll("/tmp/chunks/", 0777); nil != err {
+		return fmt.Errorf("Could not create chunk directory")
+	}
+	if err := ioutil.WriteFile(chunk.Path, content, 0777); nil != err {
+		return fmt.Errorf("Could not write chunk %v to path %v", id, chunk.Path)
+	}
+	return nil
+}
+
+func (c *Cache) GetChunk(id string, fOffset, offset, size int64) ([]byte, error) {
+	db := c.session.DB(c.dbName).C("chunks")
+
+	var chunk Chunk
+	if err := db.Find(bson.M{"_id": id}).One(&chunk); nil != err {
+		return nil, fmt.Errorf("Could not chunk %v", id)
+	}
+
+	f, err := os.Open(chunk.Path)
+	if nil != err {
+		Log.Tracef("%v", err)
+		return nil, fmt.Errorf("Could not open chunk %v at %v", id, chunk.Path)
+	}
+	defer f.Close()
+
+	buf := make([]byte, size)
+	n, err := f.ReadAt(buf, fOffset)
+	if n > 0 && (nil == err || io.EOF == err || io.ErrUnexpectedEOF == err) {
+		eOffset := int64(math.Min(float64(size), float64(len(buf))))
+		return buf[:eOffset], nil
+	}
+
+	return nil, fmt.Errorf("Could not find chunk %v", id)
 }
