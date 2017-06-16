@@ -167,7 +167,7 @@ func main() {
 		}
 	}
 
-	cache, err := NewCache(*argMongoURL, *argMongoUser, *argMongoPass, *argMongoDatabase, *argConfigPath, *argLogLevel > 3)
+	cache, err := NewCache(*argMongoURL, *argMongoUser, *argMongoPass, *argMongoDatabase, *argConfigPath, *argTempPath, *argLogLevel > 3)
 	if nil != err {
 		Log.Errorf("%v", err)
 		os.Exit(4)

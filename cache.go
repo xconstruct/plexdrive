@@ -26,6 +26,7 @@ type Cache struct {
 	session   *mgo.Session
 	dbName    string
 	tokenPath string
+	chunkPath string
 	pop       sync.Mutex
 }
 
@@ -71,7 +72,7 @@ type Chunk struct {
 }
 
 // NewCache creates a new cache instance
-func NewCache(mongoURL, mongoUser, mongoPass, mongoDatabase, cacheBasePath string, sqlDebug bool) (*Cache, error) {
+func NewCache(mongoURL, mongoUser, mongoPass, mongoDatabase, cacheBasePath, tempBasePath string, sqlDebug bool) (*Cache, error) {
 	Log.Debugf("Opening cache connection")
 
 	session, err := mgo.Dial(mongoURL)
@@ -84,6 +85,7 @@ func NewCache(mongoURL, mongoUser, mongoPass, mongoDatabase, cacheBasePath strin
 		session:   session,
 		dbName:    mongoDatabase,
 		tokenPath: filepath.Join(cacheBasePath, "token.json"),
+		chunkPath: filepath.Join(tempBasePath, "chunks"),
 	}
 
 	// getting the db
@@ -113,7 +115,7 @@ func NewCache(mongoURL, mongoUser, mongoPass, mongoDatabase, cacheBasePath strin
 		Log.Debugf("%v", err)
 		Log.Warningf("Could not clear old chunk entries")
 	}
-	if err := os.RemoveAll("/tmp/chunks"); nil != err {
+	if err := os.RemoveAll(cache.chunkPath); nil != err {
 		Log.Warningf("Could not clear old chunk files")
 	}
 
@@ -343,12 +345,12 @@ func (c *Cache) StoreChunk(id string, content []byte) error {
 
 	chunk := Chunk{
 		ID:   id,
-		Path: filepath.Join("/tmp/chunks/", id),
+		Path: filepath.Join(c.chunkPath, id),
 	}
 	if _, err := db.Upsert(bson.M{"_id": id}, &chunk); nil != err {
 		return fmt.Errorf("Could not store chunk %v", id)
 	}
-	if err := os.MkdirAll("/tmp/chunks/", 0777); nil != err {
+	if err := os.MkdirAll(c.chunkPath, 0777); nil != err {
 		return fmt.Errorf("Could not create chunk directory")
 	}
 	if err := ioutil.WriteFile(chunk.Path, content, 0777); nil != err {
