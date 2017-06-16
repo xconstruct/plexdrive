@@ -3,7 +3,6 @@ package main
 import (
 	"fmt"
 	"io/ioutil"
-	"math"
 	"net/http"
 	"strings"
 	"time"
@@ -54,14 +53,7 @@ func (m *DownloadManager) Download(object *APIObject, offset, size int64) ([]byt
 		readAheadOffset += m.ChunkSize
 	}
 
-	chunk, err := m.getChunk(request, fOffset, offset, size)
-	if nil != err {
-		return nil, err
-	}
-
-	sOffset := int64(math.Min(float64(fOffset), float64(len(chunk))))
-	eOffset := int64(math.Min(float64(fOffset+size), float64(len(chunk))))
-	return chunk[sOffset:eOffset], nil
+	return m.getChunk(request, fOffset, offset, size)
 }
 
 func (m *DownloadManager) downloadThread() {
@@ -72,7 +64,7 @@ func (m *DownloadManager) downloadThread() {
 
 func (m *DownloadManager) loadChunk(request *DownloadRequest) {
 	if !m.Cache.ChunkExists(request.ID) && !m.Cache.DownloadRunning(request.ID) {
-		Log.Debugf("Starting download request %v (offset: %v)", request.ID, request.Offset)
+		Log.Debugf("Starting download request %v (offset: %v / size: %v)", request.ID, request.Offset, request.Object.Size)
 
 		defer m.Cache.DeleteDownload(request.ID)
 		if err := m.Cache.ActivateDownload(request); nil != err {
@@ -93,9 +85,6 @@ func (m *DownloadManager) loadChunk(request *DownloadRequest) {
 }
 
 func (m *DownloadManager) getChunk(request *DownloadRequest, fOffset, offset, size int64) ([]byte, error) {
-	for !m.Cache.ChunkExists(request.ID) {
-		time.Sleep(500 * time.Millisecond)
-	}
 	return m.Cache.GetChunk(request.ID, fOffset, offset, size)
 }
 
@@ -109,7 +98,7 @@ func downloadFromAPI(client *http.Client, chunkSize, delay int64, request *Downl
 	offsetStart := request.Offset - fOffset
 	offsetEnd := offsetStart + chunkSize
 
-	Log.Debugf("Requesting object %v (%v) bytes %v - %v from API (preload: %v)",
+	Log.Tracef("Requesting object %v (%v) bytes %v - %v from API (preload: %v)",
 		request.Object.ObjectID, request.Object.Name, offsetStart, offsetEnd, request.Preload)
 	req, err := http.NewRequest("GET", request.Object.DownloadURL, nil)
 	if nil != err {

@@ -267,6 +267,7 @@ func NewDownloadRequest(object *APIObject, offset, size int64, preload bool) *Do
 	}
 }
 
+// AddToDownloadQueue adds a request to the download queue
 func (c *Cache) AddToDownloadQueue(request *DownloadRequest) {
 	db := c.session.DB(c.dbName).C("downloads")
 
@@ -276,6 +277,7 @@ func (c *Cache) AddToDownloadQueue(request *DownloadRequest) {
 	}
 }
 
+// DownloadRunning check if a download is already running
 func (c *Cache) DownloadRunning(id string) bool {
 	db := c.session.DB(c.dbName).C("downloads")
 
@@ -286,6 +288,7 @@ func (c *Cache) DownloadRunning(id string) bool {
 	return n > 0
 }
 
+// ActivateDownload indicates that the download has been started
 func (c *Cache) ActivateDownload(request *DownloadRequest) error {
 	db := c.session.DB(c.dbName).C("downloads")
 
@@ -296,6 +299,7 @@ func (c *Cache) ActivateDownload(request *DownloadRequest) error {
 	return nil
 }
 
+// DeleteDownload removes the download request when the download is finished
 func (c *Cache) DeleteDownload(id string) {
 	db := c.session.DB(c.dbName).C("downloads")
 
@@ -304,6 +308,7 @@ func (c *Cache) DeleteDownload(id string) {
 	}
 }
 
+// PopDownloadQueue pops an element from the queue in correct order (this request is blocking)
 func (c *Cache) PopDownloadQueue() *DownloadRequest {
 	c.pop.Lock()
 	defer c.pop.Unlock()
@@ -330,6 +335,7 @@ func (c *Cache) PopDownloadQueue() *DownloadRequest {
 	return <-response
 }
 
+// ChunkExists tests if a chunk exists
 func (c *Cache) ChunkExists(id string) bool {
 	db := c.session.DB(c.dbName).C("chunks")
 
@@ -340,6 +346,7 @@ func (c *Cache) ChunkExists(id string) bool {
 	return n > 0
 }
 
+// StoreChunk stores a chunk to disk/cache
 func (c *Cache) StoreChunk(id string, content []byte) error {
 	db := c.session.DB(c.dbName).C("chunks")
 
@@ -359,18 +366,44 @@ func (c *Cache) StoreChunk(id string, content []byte) error {
 	return nil
 }
 
-func (c *Cache) GetChunk(id string, fOffset, offset, size int64) ([]byte, error) {
-	db := c.session.DB(c.dbName).C("chunks")
+type chunkResponse struct {
+	chunk *Chunk
+	err   error
+}
 
-	var chunk Chunk
-	if err := db.Find(bson.M{"_id": id}).One(&chunk); nil != err {
-		return nil, fmt.Errorf("Could not chunk %v", id)
+// GetChunk blocks till a chunk is finished and returns the content of the chunk
+func (c *Cache) GetChunk(id string, fOffset, offset, size int64) ([]byte, error) {
+	chunkChannel := make(chan chunkResponse)
+
+	go func() {
+		for !c.ChunkExists(id) {
+			time.Sleep(100 * time.Millisecond)
+		}
+
+		db := c.session.DB(c.dbName).C("chunks")
+
+		var chunk Chunk
+		if err := db.Find(bson.M{"_id": id}).One(&chunk); nil != err {
+			chunkChannel <- chunkResponse{
+				err: fmt.Errorf("Could not chunk %v", id),
+			}
+			return
+		}
+		chunkChannel <- chunkResponse{
+			chunk: &chunk,
+		}
+	}()
+
+	response := <-chunkChannel
+
+	if nil != response.err {
+		return nil, response.err
 	}
 
-	f, err := os.Open(chunk.Path)
+	f, err := os.Open(response.chunk.Path)
 	if nil != err {
 		Log.Tracef("%v", err)
-		return nil, fmt.Errorf("Could not open chunk %v at %v", id, chunk.Path)
+		return nil, fmt.Errorf("Could not open chunk %v at %v", id, response.chunk.Path)
 	}
 	defer f.Close()
 
